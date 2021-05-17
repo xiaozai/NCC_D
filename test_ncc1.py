@@ -33,48 +33,32 @@ class NCC_depth(torch.nn.Module):
     def __init__(self, template, pos):
         super(NCC_depth, self).__init__()
 
-        self.H = template.shape[0]
-        self.W = template.shape[1]
         self.pos = pos               # [x, y, w, h] in image
-
-        self.template = template     # H, W
+        self.flag = 'init'
         self.std = np.std(template[np.nonzero(template)])
-        print(self.std)
+        self.depth = max(1, np.median(template[np.nonzero(template)]))
+        self.mask = self.get_mask(template, self.depth)
+        self.ncc = self.initalize_ncc(template.copy())
+        self.template = template
 
-        self.flag = 'normal'
+    def initalize_ncc(self, template):
+        template = (template - self.depth) * 1.0 / self.depth
+        template = np.asarray(template, dtype=np.float32)
+        template = torch.from_numpy(template[np.newaxis, ...])
+        template = template.cuda()
 
-        self.depth = max(1, np.median(template))
+        ncc = NCC(template)
+        ncc = ncc.cuda()
 
-        self.initialize(template.copy())
+        return ncc
 
-        self.template = (self.template - self.depth) * 1.0 / self.depth
-        self.template = np.asarray(self.template, dtype=np.float32)
-        self.template = torch.from_numpy(self.template[np.newaxis, ...])
-        self.template = self.template.cuda()
-
-        self.ncc = NCC(self.template)
-        self.ncc = self.ncc.cuda()
-
-    def initialize(self, template):
-        prob = template
-        prob[prob > self.depth+self.std//2] = 0
-        prob[prob < self.depth-self.std//2] = 0
-        prob = (prob - self.depth) / (self.std * 2/2)
-        prob = ndimage.median_filter(prob, size=3)
-
-        l = 256
-        n = 12
-        sigma = l / (4. * n)
-        prob = filters.gaussian(prob, sigma=sigma)
-        mask = prob > 0.7 * prob.mean()
-        mask = np.asarray(mask, dtype=np.uint8)
-        self.mask = mask
-
-
-    def generate_search_region(self, frame, scale=4, center=None):
+    def generate_search_region(self, frame, scale=None, center=None):
 
         H, W = frame.shape
         x0, y0, w, h = self.pos
+
+        if scale is None:
+            scale = 4 if self.flag in ['occlusion', 'fully_occlusion', 'not_found'] else 2
 
         if center is not None:
             center_x, center_y = center[0], center[1]
@@ -83,7 +67,7 @@ class NCC_depth(torch.nn.Module):
             center_y = max(0, center_y)
             center_y = min(H, center_y)
         else:
-            center_x, center_y = int(x0 + self.W//2), int(y0 + self.H//2)
+            center_x, center_y = int(x0 + w//2), int(y0 + h//2)
 
         new_w, new_h = w*scale, h*scale
 
@@ -101,21 +85,13 @@ class NCC_depth(torch.nn.Module):
         search_region = [new_x0, new_y0, new_x1-new_x0, new_y1-new_y0]
         search_img = frame[new_y0:new_y1, new_x0:new_x1]
 
+        return search_img, search_region
+
+    def get_response(self, search_img):
+
         search_img = (search_img - self.depth) * 1.0 / (self.depth+0.001)
         search_img = np.asarray(search_img, dtype=np.float32)
         search_img = torch.from_numpy(search_img[np.newaxis, np.newaxis, ...])
-
-        return search_img, search_region
-
-    def track(self, frame):
-
-        if self.flag in ['occlusion', 'fully_occlusion', 'not_found']:
-            search_img, search_region = self.generate_search_region(frame, scale=4)
-        elif self.flag == 'uncertain':
-            search_img, search_region = self.generate_search_region(frame, scale=2)
-        else:
-            search_img, search_region = self.generate_search_region(frame, scale=1.6)
-
         search_img = search_img.cuda()
 
         response = self.ncc(search_img)
@@ -124,231 +100,235 @@ class NCC_depth(torch.nn.Module):
 
         search_img = search_img.detach().cpu().numpy()
         search_img = np.squeeze(search_img)
-        search_img = search_img * self.depth + self.depth
+        search_img = search_img * (self.depth+0.001) + self.depth
 
-        # target_box, target_mask, k_candidate_dists, k_xy_dists, k_d_dists, k_mask_dists, k_candidate_boxes, k_candidate_ims, k_candidate_responses, k_candidate_masks, k_candidate_centers, peaks, peak_depths, peak_responses, peaks_in_frame, search_img, search_region, response  = self.localize(frame, search_img, search_region, response)
-        return peaks, peak_depths, peak_responses, peak_masks = self.localize(frame, search_img, search_region, response)
+        return response, search_img
 
-        # return target_box, target_mask, k_candidate_dists, k_xy_dists, k_d_dists, k_mask_dists, k_candidate_boxes, k_candidate_ims, k_candidate_responses, k_candidate_masks, k_candidate_centers, peaks, peak_depths, peak_responses, peaks_in_frame, search_img, search_region, response
-        return peaks, peak_depths, peak_responses, peak_masks
+    def track(self, frame):
+
+        search_img, search_region = self.generate_search_region(frame)
+        response, search_img = self.get_response(search_img)
+        peaks, peak_depths, peak_scales, peak_responses, peak_masks, distance, matching_res, matching_box, new_masks = self.localize(frame, search_img, search_region, response)
+
+        return peaks, peak_depths, peak_responses, peak_masks, search_img, response, distance, matching_res, matching_box, new_masks
 
     def localize(self, frame, search_img, search_region, response):
 
         H, W = frame.shape
         search_x0, search_y0, search_w, search_h = search_region
+        last_center = [self.pos[0]+self.pos[2]//2, self.pos[1]+self.pos[3]//2]
+        xy_threshold = np.sqrt(self.pos[2]*self.pos[3]) + 0.000001
 
         ''' 1) find the peak response in the response map of the search_image'''
         response = ndimage.maximum_filter(response, size=15, mode='constant')
         peaks = feature.peak_local_max(response, min_distance=15)
 
-        center_x, center_y, peak_depths, peak_responses = [], [], [], []
+        center_x, center_y, peak_depths, peak_scales, peak_responses, peak_masks, distance = [], [], [], [], [], [], []
 
         for p_xy in peaks:
-            center_x.append(p_xy[1])
-            center_y.append(p_xy[0])
-            peak_responses.append(response[p_xy[0], p_xy[1]])
+            py, px = p_xy
 
-            temp_x0 = max(0, p_xy[0]-30)
-            temp_x1 = min(search_w, p_xy[0]+30)
-            temp_y0 = max(0, p_xy[1]-30)
-            temp_y1 = min(search_h, p_xy[0]+30)
-            temp_area = search_img[temp_y0:temp_y1, temp_x0:temp_x1]
-            peak_depths.append(np.median(temp_area[np.nonzero(temp_area)]))
+            px_in_frame, py_in_frame = px+search_x0, py+search_y0
+            xy_dist = np.sqrt((px_in_frame - last_center[0])**2 + (py_in_frame - last_center[1])**2)
 
+            temp_area = search_img[max(0, py-20):min(search_h, py+20), max(0, px-20):min(search_w, px+20)]
+            pd = np.median(temp_area[np.nonzero(temp_area)])
+            d_diff = abs(pd - self.depth) / self.depth
+
+            if xy_dist < xy_threshold and d_diff < 0.5:
+
+                center_x.append(px)
+                center_y.append(py)
+                peak_depths.append(pd)
+                peak_responses.append(response[py, px])
+                peak_masks.append(self.get_mask(search_img, pd))
+                peak_scales.append(self.depth / (pd +0.000001))
+
+                xy_diff = xy_dist / xy_threshold
+                xyd_diff = xy_diff * d_diff
+                distance.append(xyd_diff)
 
         peaks = np.c_[center_x, center_y]
         peak_depths = np.asarray(peak_depths)
         peak_responses = np.asarray(peak_responses)
+        peak_masks = np.asarray(peak_masks)
+        peak_scales = np.asarray(peak_scales)
 
-        peak_masks = np.zeros((len(peaks), search_h, search_w), dtype=np.uint8)
-        for kk, p_d in enumerate(peak_depths):
-            mask = search_img.copy()
-            mask = mask.copy()
-            mask[mask > p_d+self.std//2] = 0
-            mask[mask < p_d-self.std//2] = 0
-            mask = (mask - p_d) / (self.std * 2/2)
-            mask = ndimage.median_filter(mask, size=3)
+        ''' Minimum xy*d '''
+        distance = np.asarray(distance)
+        sorted_dist = distance.copy()
+        sorted_dist.sort()
+        min_distance = sorted_dist[:3]
+        min_idx = [np.where(distance == md)[0][0] for md in min_distance]
 
-            l = 256
-            n = 12
-            sigma = l / (4. * n)
-            mask = filters.gaussian(mask, sigma=sigma)
-            mask = mask > 0.7 * mask.mean()
-            mask = np.asarray(mask, dtype=np.uint8)
-            peak_masks[kk] = mask
+        peaks = peaks[min_idx]
+        peak_depths = peak_depths[min_idx]
+        peak_responses = peak_responses[min_idx]
+        peak_masks = peak_masks[min_idx]
+        peak_scales = peak_scales[min_idx]
+
+        matching_res, matching_box, new_masks = self.mask_matching(search_img, peak_masks, peak_scales)
+
+        return peaks, peak_depths, peak_scales, peak_responses, peak_masks, distance, matching_res, matching_box, new_masks
+
+    def mask_matching(self, search_img, masks, scales):
+
+        ''' Template matching
+            If the method is TM_SQDIFF or TM_SQDIFF_NORMED, take minimum otherwise maximum
+        '''
+        template = self.mask
+        template = np.asarray(template, dtype=np.uint8)
+        w, h = template.shape[::-1]
+        results = []
+        boxes = []
+        new_boxes = []
+        centers = []
+        aligned_masks = []
+        new_masks = []
+        new_imgs = []
+        kpt_template = []
+        kpt_search = []
+        kpt_matches = []
+
+        for pm, s in zip(masks, scales):
+            pm = np.asarray(pm, dtype=np.uint8)
+
+            ''' scaling based on the depth '''
+            scaled_template = cv2.resize(template, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+
+            ''' find the center location based on the Template Matching '''
+            res = cv2.matchTemplate(pm, scaled_template, cv2.TM_SQDIFF) # W-w+, H-h+1
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+            box = [min_loc[0], min_loc[1], int(w*s), int(h*s)]
+            cnt = [min_loc[0]+int(w*s/2), min_loc[1]+int(h*s/2)]
+
+            ''' Find the correct mask '''
+            # new_pm = np.zeros_like(pm)
+            # new_pm[box[1]:box[1]+box[3], box[0]:box[0]+box[2]] = scaled_template
+            # template_hist = cv2.calcHist([scaled_template], [0], None, [256], [0, 256])
+            # template_hist = cv2.normalize(template_hist, template_hist).flatten()
+            #
+            # pm_hist = cv2.calcHist([pm], [0], None, [256], [0, 256])
+            # pm_hist = cv2.normalize(pm_hist, pm_hist).flatten()
+            #
+            # d = cv2.compareHist(template_hist, pm_hist, cv2.HISTCMP_CORREL)
+
+            ''' Find the pixels belong to target, e.g. the closest ones ???? '''
+            new_im = search_img.copy()
+            new_im = np.multiply(new_im, pm)
 
 
-        return peaks, peak_depths, peak_responses, peak_masks, search_img
+
+            ''' Find the best rotation that -> min err = || R*Temp - T0 || '''
+            #
+            # def get_gradient(im) :
+            #     # Calculate the x and y gradients using Sobel operator
+            #     grad_x = cv2.Sobel(im,cv2.CV_32F,1,0,ksize=3)
+            #     grad_y = cv2.Sobel(im,cv2.CV_32F,0,1,ksize=3)
+            #     # Combine the two gradients
+            #     grad = cv2.addWeighted(np.absolute(grad_x), 0.5, np.absolute(grad_y), 0.5, 0)
+            #     return grad
+            #
+            #
+            # new_pm = np.zeros_like(pm, dtype=np.uint8)
+            # new_pm[box[1]:box[1]+box[3], box[0]:box[0]+box[2]] = scaled_template
+            #
+            #
+            # warp_mode = cv2.MOTION_TRANSLATION
+            # warp_matrix = np.eye(2, 3, dtype=np.float32)
+            # number_of_iterations = 50000
+            # termination_eps = 1e-10
+            # criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
+            # (cc, warp_matrix) = cv2.findTransformECC (get_gradient(pm), get_gradient(new_pm), warp_matrix, warp_mode, criteria)
+            # aligned_pm = cv2.warpAffine(new_pm, warp_matrix, pm.shape, flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+            #
+            # new_xy = np.nonzero(aligned_pm)
+            #
+            # new_x0 = np.min(new_xy[1])
+            # new_x1 = np.max(new_xy[1])
+            # new_y0 = np.min(new_xy[0])
+            # new_y1 = np.max(new_xy[0])
+            #
+            # new_box = [new_x0, new_y0, new_x1-new_x0, new_y1-new_y0]
+
+            ''' Find the rotated box ? mask '''
+            # new_pm = np.zeros_like(pm, dtype=np.uint8)
+            # new_pm[box[1]:box[1]+box[3], box[0]:box[0]+box[2]] = scaled_template
+            # keypoints_template, keypoints_search, matches = self.SIFT_matching(new_pm, pm)
 
 
-        #
-        #
-        #
-        # ''' 2) find the candidate boxes in the frame '''
-        # cand_H, cand_W = int(self.H*1.2), int(self.W*1.2)
-        #
-        # peaks_in_frame = np.asarray([[p_xy[0]+search_region[0], p_xy[1]+search_region[1]] for p_xy in peaks])
-        # # candidate_boxes_in_frame = np.zeros((len(peaks_in_frame), 4), dtype=np.int32)
-        # candidate_boxes_in_frame = []
-        # for ii, p_xy in enumerate(peaks_in_frame):
-        #     x0 = max(0, p_xy[0]-cand_W//2)
-        #     y0 = max(0, p_xy[1]-cand_H//2)
-        #     x1 = min(W, p_xy[0]+cand_W//2)
-        #     y1 = min(H, p_xy[1]+cand_H//2)
-        #
-        #     ''' remove the outliers '''
-        #     xy_diff = np.linalg.norm(np.asarray([p_xy[0] - self.pos[0], p_xy[1]-self.pos[1]]))
-        #     d_diff = max(frame[p_xy[1], p_xy[0]], self.depth) / (min(frame[p_xy[1], p_xy[0]], self.depth) + 0.0001)
-        #
-        #     if xy_diff < 1.5*np.sqrt(self.H*self.W) and d_diff < 1.5:
-        #         candidate_boxes_in_frame.append([x0, y0, x1-x0, y1-y0])
-        #
-        # candidate_boxes_in_frame = np.asarray(candidate_boxes_in_frame, dtype=np.int32)
-        #
-        #
-        # ''' 3) get the response map for each candidate box '''
-        # candidates = np.zeros((len(candidate_boxes_in_frame), cand_H, cand_W), dtype=np.float32)
-        # candidates_response =  np.zeros((len(candidate_boxes_in_frame), cand_H, cand_W), dtype=np.float32)
-        # max_candidate_response = []
-        #
-        # for ii, box in enumerate(candidate_boxes_in_frame):
-        #     cand = np.zeros((cand_H, cand_W), dtype=np.float32)
-        #
-        #     cand_im = frame[box[1]:box[1]+box[3], box[0]:box[0]+box[2]]
-        #     cand[:box[3], :box[2]] = cand_im
-        #     cand = (cand - self.depth) * 1.0 / (self.depth+0.001)
-        #     cand = torch.from_numpy(cand[np.newaxis, np.newaxis, ...])
-        #     cand = cand.cuda()
-        #     cand_response = self.ncc(cand)
-        #     cand_response = cand_response.detach().cpu().numpy().squeeze()
-        #     cand = cand.detach().cpu().numpy().squeeze()
-        #     cand = cand * self.depth + self.depth
-        #
-        #     candidates[ii] = cand[:cand_H, :cand_W]
-        #     candidates_response[ii] = cand_response[:cand_H, :cand_W]
-        #     max_candidate_response.append(np.max(cand_response[:cand_H, :cand_W]))
-        #
-        # ''' 4) find the top K maximum response position '''
-        # K = 10
-        # if len(candidates) < K:
-        #     k_candidate_ims = candidates
-        #     k_candidate_responses = candidates_response
-        #     k_candidate_boxes = candidate_boxes_in_frame
-        #     k_candidate_centers = peaks_in_frame
-        # else:
-        #     k_candidate_ims = np.zeros((K, cand_H, cand_W), dtype=np.float32)
-        #     k_candidate_responses = np.zeros((K, cand_H, cand_W), dtype=np.float32)
-        #     k_candidate_boxes = np.zeros((K, 4), dtype=np.int32)
-        #     k_candidate_centers = np.zeros((K, 2), dtype=np.int32)
-        #
-        #     topK_response = max_candidate_response
-        #     topK_response.sort(reverse=True)
-        #     topK_response = topK_response[:K]
-        #
-        #     for k, k_resp in enumerate(topK_response):
-        #         k_idx = np.where(max_candidate_response == k_resp)[0]
-        #
-        #         k_candidate_ims[k] = candidates[k_idx]
-        #         k_candidate_responses[k] = candidates_response[k_idx]
-        #         k_candidate_boxes[k] = candidate_boxes_in_frame[k_idx]
-        #         k_candidate_centers[k] = peaks_in_frame[k_idx]
-        #
-        # ''' 5) mask '''
-        # k_candidate_depths = []
-        # k_candidate_masks = np.zeros_like(k_candidate_ims, dtype=np.uint8)
-        #
-        # for kk, cand_im in enumerate(k_candidate_ims):
-        #     cand_d = np.median(cand_im[np.nonzero(cand_im)])
-        #     k_candidate_depths.append(cand_d)
-        #
-        #     prob = cand_im.copy()
-        #     prob[prob > cand_d+self.std//2] = 0
-        #     prob[prob < cand_d-self.std//2] = 0
-        #     prob = (prob - cand_d) / (self.std * 2/2)
-        #     prob = ndimage.median_filter(prob, size=3)
-        #
-        #     l = 256
-        #     n = 12
-        #     sigma = l / (4. * n)
-        #     prob = filters.gaussian(prob, sigma=sigma)
-        #     mask = prob > 0.7 * prob.mean()
-        #     mask = np.asarray(mask, dtype=np.uint8)
-        #     k_candidate_masks[kk] = mask
-        #
-        #
-        # ''' 6) Choose the location '''
-        # k_candidate_dists = []
-        # k_xy_dists, k_d_dists, k_mask_dists = [], [], []
-        # for kk, _ in enumerate(k_candidate_ims):
-        #     k_cand_boxes = k_candidate_boxes[kk, ...]
-        #     k_cand_mask = k_candidate_masks[kk, ...]
-        #     k_cand_d = k_candidate_depths[kk]
-        #
-        #     xy_dist = np.linalg.norm(k_cand_boxes - self.pos)
-        #     # d_dist = max(k_cand_d,  self.depth) / (min(k_cand_d, self.depth) + 0.00001)
-        #     d_dist = abs(k_cand_d - self.depth) / (self.depth + 0.000001)
-        #     mask_dist = abs(np.count_nonzero(k_cand_mask) - np.count_nonzero(self.mask)) / (np.count_nonzero(self.mask) + 0.0000001)
-        #
-        #     dist = xy_dist * d_dist * mask_dist
-        #
-        #     k_candidate_dists.append(dist)
-        #     k_xy_dists.append(xy_dist)
-        #     k_d_dists.append(d_dist)
-        #     k_mask_dists.append(mask_dist)
-        #
-        # ''' 7) refine the location '''
-        # if len(k_candidate_boxes) > 0:
-        #     target_idx = np.argmin(k_candidate_dists)
-        #     target_box = k_candidate_boxes[target_idx, ...]
-        #     target_mask = k_candidate_masks[target_idx, ...]
-        #     target_depth = k_candidate_depths[target_idx]
-        #
-        #
-        #     center_x, center_y = np.nonzero(target_mask)
-        #     target_cx, target_cy = np.mean(center_x), np.mean(center_y)
-        #
-        #     target_cx_in_frame, target_cy_in_frame = int(target_cx + target_box[0]), int(target_cy + target_box[1])
-        #
-        #     target_H, target_W = int(self.H*1.2), int(self.W*1.2)
-        #     target_x0_in_frame = max(0, target_cx_in_frame-target_W//2)
-        #     target_y0_in_frame = max(0, target_cy_in_frame-target_H//2)
-        #     target_x1_in_frame = min(W, target_cx_in_frame+target_W//2)
-        #     target_y1_in_frame = min(H, target_cy_in_frame+target_H//2)
-        #     target_area_in_frame = frame[target_y0_in_frame:target_y1_in_frame, target_x0_in_frame:target_x1_in_frame]
-        #
-        #     target_area_in_frame = target_area_in_frame.copy()
-        #     target_area_in_frame[target_area_in_frame > target_depth+self.std//2] = 0
-        #     target_area_in_frame[target_area_in_frame < target_depth-self.std//2] = 0
-        #     target_area_in_frame = (target_area_in_frame - target_depth) / (self.std * 2/2)
-        #     target_area_in_frame = ndimage.median_filter(target_area_in_frame, size=3)
-        #
-        #     l = 256
-        #     n = 12
-        #     sigma = l / (4. * n)
-        #     target_area_in_frame = filters.gaussian(target_area_in_frame, sigma=sigma)
-        #     target_mask = target_area_in_frame > 0.7 * target_area_in_frame.mean()
-        #     target_mask = np.asarray(target_mask, dtype=np.uint8)
-        #
-        #     target_xy = np.nonzero(target_mask)
-        #     target_x0 = np.min(target_xy[0])
-        #     target_x1 = np.max(target_xy[0])
-        #     target_y0 = np.min(target_xy[1])
-        #     target_y1 = np.max(target_xy[1])
-        #
-        #     target_mask = target_mask[target_y0:target_y1, target_x0:target_x1]
-        #
-        #     target_box = np.asarray([target_x0+target_x0_in_frame, target_y0+target_y0_in_frame, target_x1-target_x0, target_y1-target_y0])
-        #
-        #     if np.linalg.norm(target_box - self.pos) < np.sqrt(self.H*self.W) and  abs(k_cand_d - self.depth) / (self.depth + 0.000001) < 0.3:
-        #         self.pos = target_box
-        #
-        # else:
-        #     target_idx = 0
-        #     target_box = self.pos
-        #     target_mask = np.zeros((self.H, self.W), dtype=np.uint8)
-        #
-        #
-        # return target_box, target_mask, k_candidate_dists, k_xy_dists, k_d_dists, k_mask_dists, k_candidate_boxes, k_candidate_ims, k_candidate_responses, k_candidate_masks, k_candidate_centers, peaks, peak_depths, peak_responses, peaks_in_frame, search_img, search_region, response
+            results.append(res)
+            boxes.append(box)
+            centers.append(cnt)
+            # aligned_masks.append(aligned_pm)
+            # new_boxes.append(new_box)
+            new_imgs.append(new_im)
+
+            # new_masks.append(new_pm)
+            # new_masks.append(d)
+            # kpt_template.append(keypoints_template)
+            # kpt_search.append(keypoints_search)
+            # kpt_matches.append(matches)
+
+        results = np.asarray(results)
+        boxes = np.asarray(boxes)
+        centers = np.asarray(centers)
+        new_imgs = np.asarray(new_imgs)
+        # aligned_masks = np.asarray(aligned_masks)
+        # new_boxes = np.asarray(new_boxes)
+        # new_masks = np.asarray(new_masks)
+        # kpt_template = np.asarray(kpt_template)
+        # kpt_search = np.asarray(kpt_search)
+        # kpt_matches = np.asarray(kpt_matches)
+
+        return results, boxes, new_imgs # , new_masks # , aligned_masks, new_boxes  #  , kpt_template, kpt_search, kpt_matches
+
+    def SIFT_matching(self, template, search_img):
+        sift = cv2.xfeatures2d.SIFT_create()
+
+        template_gray = cv2.normalize(template, None, 0, 1, cv2.NORM_MINMAX)
+        template_gray = np.asarray(template_gray*255, dtype=np.uint8)
+        keypoints_template, descriptors_template = sift.detectAndCompute(template_gray, None)
+
+        bf = cv2.BFMatcher(cv2.NORM_L1, crossCheck=True)
+
+        search_img_gray = search_img.copy()
+        search_img_gray = cv2.normalize(search_img_gray, None, 0, 1, cv2.NORM_MINMAX)
+        search_img_gray = np.asarray(search_img_gray*255, dtype=np.uint8)
+        keypoints_search, descriptors_search = sift.detectAndCompute(search_img_gray, None)
+
+        matches = bf.match(descriptors_template, descriptors_search)
+        matches = sorted(matches, key=lambda x:x.distance)
+
+        # (x,y)
+        keypoints_template = [kp.pt for kp in keypoints_template]
+        keypoints_search = [kp.pt for kp in keypoints_search]
+
+        # m.queryIdx  in the template
+        # m.trainIdx  in the search_img
+        matches_idx_template = [m.queryIdx for m in matches]
+        matches_idx_search = [m.trainIdx for m in matches]
+
+
+        return keypoints_template, keypoints_search, matches
+
+
+    def get_mask(self, image, depth):
+        mask = image.copy()
+        mask = mask.copy()
+        mask[mask > depth+self.std//2] = 0
+        mask[mask < depth-self.std//2] = 0
+        mask = (mask - depth) / (self.std * 2/2)
+        mask = ndimage.median_filter(mask, size=3)
+
+        l = 256
+        n = 12
+        sigma = l / (4. * n)
+        mask = filters.gaussian(mask, sigma=sigma)
+        mask = mask > 0.7 * mask.mean()
+        mask = np.asarray(mask, dtype=np.uint8)
+
+        return mask
 
     def refine_box(self, candidate_boxes):
 
@@ -358,7 +338,7 @@ class NCC_depth(torch.nn.Module):
 if __name__ == '__main__':
 
     # seq = 'humans_shirts_room_occ_1_A' # !!!!!!
-    # seq = 'backpack_blue'   3 !!!!!
+    # seq = 'backpack_blue'    #!!!!!
     # seq = 'bicycle_outside' # !!!!
     # seq = 'XMG_outside'
     # seq = 'backpack_robotarm_lab_occ'
@@ -389,8 +369,7 @@ if __name__ == '__main__':
 
         tic_track = time.time()
         frame = cv2.imread(os.path.join(data_path, '%08d.png'%(frame_id+1)), -1)
-        # target_box, target_mask, k_candidate_dists, k_xy_dists, k_d_dists, k_mask_dists,  k_candidate_boxes, k_candidate_ims, k_candidate_responses, k_candidate_masks, k_candidate_centers, peaks, peak_depths, peak_responses, peaks_in_frame, search_img, search_region, response = tracker.track(frame)
-        peaks, peak_depths, peak_responses, peak_masks, search_img = tracker.track(frame)
+        peaks, peak_depths, peak_responses, peak_masks, search_img, response, distance, matching_res, matching_box, new_masks = tracker.track(frame)
 
         toc_track = time.time()
         print('Track a frame time : ', toc_track - tic_track)
@@ -399,8 +378,8 @@ if __name__ == '__main__':
 
         plt.clf()
 
-        M = 11
-        N = 6
+        M = 4
+        N = 4
 
         plt.axis('off')
 
@@ -420,106 +399,87 @@ if __name__ == '__main__':
 
         ax3 = plt.subplot(M,N,3)
         ax3.imshow(search_img)
-        for p_xy in peaks:
-            ax3.scatter(p_xy[0], p_xy[1], linewidth=1, c='r')
+
         ax3.set_title('search_img')
         ax3.set_xticks([])
         ax3.set_yticks([])
 
+        ax4 = plt.subplot(M, N, 4)
+        ax4.imshow(response)
+
+        ax4.set_xticks([])
+        ax4.set_yticks([])
+
+        for p_xy in peaks:
+            ax3.scatter(p_xy[0], p_xy[1], linewidth=1, c='r')
+            ax4.scatter(p_xy[0], p_xy[1], linewidth=1, c='r')
+
         for ii, pm in enumerate(peak_masks):
-            ax = plt.subplot(M, N, 4+ii)
+            ax = plt.subplot(M, N, 5+ii)
+
+            p_xy = peaks[ii]
             ax.imshow(pm)
-        # ax2 = plt.subplot(M,N,4)
-        # ax2.imshow(frame)
-        # ax2.set_xticks([])
-        # ax2.set_yticks([])
+            ax.scatter(p_xy[0], p_xy[1], linewidth=1, c='r')
+
+            box = matching_box[ii]
+            center = [box[0]+box[2]//2, box[1]+box[3]//2]
+            rect = patches.Rectangle((box[0], box[1]), box[2], box[3], edgecolor='b', facecolor='none')
+            ax.add_patch(rect)
+
+
+            # box = new_boxes[ii]
+            # rect = patches.Rectangle((box[0], box[1]), box[2], box[3], edgecolor='g', facecolor='none')
+            # ax.add_patch(rect)
+
+            ax.scatter(center[0], center[1], linewidth=1, c='b')
+
+            ax.set_title(str(distance[ii]))
+            #
+            # kpts = kpt_search[ii]
+            # kpts = np.asarray(kpts)
+            # for xy in kpts:
+            #     ax.scatter(xy[0], xy[1], linewidth=1, c='r')
+            #
+            # match = kpt_matches[ii]
+            # match_idx = [m.trainIdx for m in match]
+            # match_idx = np.asarray(match_idx)
+            # match_pts = kpts[match_idx]
+            # for mpt in match_pts:
+            #     ax.scatter(mpt[0], mpt[1], linewidth=1, c='g')
+
+        for ii, ms in enumerate(matching_res):
+
+            ax = plt.subplot(M, N, 9+ii)
+
+            # ms = ms+pm
+            # ms = cv2.normalize(ms, None, 0, 1, cv2.NORM_MINMAX)
+            ax.imshow(ms)
+
+        # for ii, ams in enumerate(aligned_masks):
         #
-        # for box in k_candidate_boxes:
-        #     x0, y0, w, h = box
-        #     rect = patches.Rectangle((x0, y0), w, h, linewidth=1, edgecolor='r', facecolor='none')
-        #     ax2.add_patch(rect)
+        #     pm = peak_masks[ii]
         #
-        # x0, y0, w, h = search_region
-        # rect = patches.Rectangle((x0, y0), w, h, linewidth=2, edgecolor='g', facecolor='none')
-        # ax2.add_patch(rect)
+        #     ax = plt.subplot(M, N, 13+ii)
+        #     ax.imshow(ams)
         #
-        #
-        # x0, y0, w, h = target_box
-        # rect = patches.Rectangle((x0, y0), w, h, linewidth=2, edgecolor='b', facecolor='none')
-        # ax2.add_patch(rect)
-        #
-        # ax2.set_title('frame')
-        #
-        # ax3 = plt.subplot(M,N,5)
-        # ax3.imshow(np.exp(response))
-        # ax3.set_xticks([])
-        # ax3.set_yticks([])
-        # ax3.set_title('responses')
-        #
-        # ax6 = plt.subplot(M, N, 6)
-        # ax6.imshow(target_mask)
-        # ax6.set_xticks([])
-        # ax6.set_yticks([])
-        # ax6.set_title('predicted mask')
-        #
-        # for ii, p_xy in enumerate(peaks):
-        #     ax3.scatter(p_xy[0], p_xy[1], linewidth=1, c='r')
-        #
-        # for ii, p_xy in enumerate(k_candidate_centers):
-        #     ax3.scatter(p_xy[0]-search_region[0], p_xy[1]-search_region[1], linewidth=1, c='g')
-        #     # ax3.text(p_xy[0]-search_region[0]+3, p_xy[1]-search_region[1]+3, str(np.max(k_candidate_responses[ii, ...])), color='white')
-        #
-        # ax3.set_title('Max response : ' + str(np.max(response)))
-        #
-        # x0_t, y0_t, w_t, h_t = target_box
-        # for ii in range(0, len(k_candidate_ims)):
-        #
-        #     ax11 = plt.subplot(M, N, ii*N+N+1)
-        #     ax11.imshow(frame)
-        #     box = k_candidate_boxes[ii, ...]
-        #
-        #     x0, y0, w, h = box
-        #     rect = patches.Rectangle((x0, y0), w, h, linewidth=1, edgecolor='r', facecolor='none')
-        #     ax11.add_patch(rect)
-        #
-        #     rect_t = patches.Rectangle((x0_t, y0_t), w_t, h_t, linewidth=1, edgecolor='b', facecolor='none')
-        #     ax11.add_patch(rect_t)
-        #
-        #     ax11.set_xticks([])
-        #     ax11.set_yticks([])
-        #     ax11.set_title(str(k_candidate_dists[ii]))
-        #
-        #     ax22 = plt.subplot(M, N, ii*N+N+2)
-        #     ax22.imshow(k_candidate_ims[ii, ...])
-        #     ax22.set_xticks([])
-        #     ax22.set_yticks([])
-        #     ax22.set_title(str(k_xy_dists[ii]) + '  ' + str(k_d_dists[ii]))
-        #
-        #     ax33 = plt.subplot(M,N,ii*N+N+3)
-        #     ax33.imshow(k_candidate_responses[ii, ...])
-        #
-        #     max_resp = np.max(k_candidate_responses[ii, ...])
-        #     max_resp_xy = np.where(k_candidate_responses[ii, ...] == max_resp)
-        #     my, mx = max_resp_xy
-        #     my, mx = my[0], mx[0]
-        #
-        #     depth = k_candidate_ims[ii, my, mx]
-        #     ax22.scatter(mx, my, linewidth=2, c='r')
-        #     ax22.text(mx+1, my+1, str(depth), color='white')
-        #     # ax22.set_title('')
-        #
-        #     ax33.set_title(str(max_resp))
-        #     ax33.scatter(mx, my, linewidth=2, c='r')
-        #     ax33.text(mx+1, my+1, str(max_resp), color='white')
-        #     ax33.set_xticks([])
-        #     ax33.set_yticks([])
-        #
-        #     ax44 = plt.subplot(M, N, ii*N+N+4)
-        #     ax44.imshow(k_candidate_masks[ii, ...])
-        #     ax44.set_title(str(k_mask_dists[ii]))
-        #     ax44.set_xticks([])
-        #     ax44.set_yticks([])
-        #     # print(k_candidate_boxes[ii, ...], max_resp)
+        #     box = new_boxes[ii]
+        #     rect = patches.Rectangle((box[0], box[1]), box[2], box[3], edgecolor='g', facecolor='none')
+        #     ax.add_patch(rect)
+
+        # new_masks, kpt_template, kpt_search, kpt_matches
+        # # m.queryIdx  in the template
+        # # m.trainIdx  in the search_img
+        # matches_idx_template = [m.queryIdx for m in kpt_matches]
+        # matches_idx_search = [m.trainIdx for m in kpt_matches]
+
+        for ii, nm in enumerate(new_masks):
+            ax = plt.subplot(M, N, 13+ii)
+            ax.imshow(nm)
+
+            # match_pts = kpt_template[ii]
+            # for xy in match_pts:
+            #     ax.scatter(xy[0], xy[1], linewidth=1, c='r')
+
 
         plt.show(block=False)
-        plt.pause(20)
+        plt.pause(3)
