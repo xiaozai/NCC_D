@@ -32,17 +32,17 @@ blue = lambda x: '\033[94m' + x + '\033[0m'
 
 class NCC_depth(torch.nn.Module):
 
-    def __init__(self, template, pos):
+    def __init__(self, frame, template, pos):
         super(NCC_depth, self).__init__()
 
         self.pos = pos               # [x, y, w, h] in image
         self.flag = 'init'
 
-        self.depth, self.std = self.get_depth(template)
 
-        self.mask = self.get_mask(template, self.depth)
-        self.ncc = self.initalize_ncc(template.copy())
-        self.template = template
+        self.template, self.mask, self.depth, self.std = self.get_mask_by_grabcut(frame, pos)
+        self.ncc = self.initalize_ncc(template)
+
+        # self.template = template
         self.angle = 5
         self.visualize = True
 
@@ -67,12 +67,69 @@ class NCC_depth(torch.nn.Module):
 
         return depth_seed, std
 
-    def get_probablity_model(self, template):
-        ''' Gaussian Probablity model, based on the (x,y,d) '''
+    def get_mask_by_grabcut(self, img, xywh):
+
+        # tic = time.time()
+
+        try:
+            x0, y0, w, h = xywh
+            H, W = img.shape
+
+            n_bg_pixels = 30
+            new_x0 = max(0, x0-n_bg_pixels)
+            new_y0 = max(0, y0-n_bg_pixels)
+            new_x1 = min(W, x0+w+n_bg_pixels)
+            new_y1 = min(H, y0+h+n_bg_pixels)
+
+            img = img[new_y0:new_y1, new_x0:new_x1]
+            box_in_img = [x0-new_x0, y0-new_y0, w, h]
+
+            mask = np.zeros(img.shape[:2],np.uint8)
+            bgdModel = np.zeros((1,65),np.float64)
+            fgdModel = np.zeros((1,65),np.float64)
+            rect = (box_in_img[0], box_in_img[1], box_in_img[0]+box_in_img[2], box_in_img[1]+box_in_img[3])
+
+            colormap = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+            colormap = np.asarray(colormap, dtype=np.uint8)
+            colormap = cv2.applyColorMap(colormap, cv2.COLORMAP_JET)
+            cv2.grabCut(colormap,mask,rect,bgdModel,fgdModel,5,cv2.GC_INIT_WITH_RECT)
+            mask2 = np.where((mask==2)|(mask==0),0,1).astype('uint8')
+
+            img = img * mask2[:, :]
+            template = img[box_in_img[1]:box_in_img[1]+box_in_img[3], box_in_img[0]:box_in_img[0]+box_in_img[2]]
+
+            template_depth = np.median(template[np.nonzero(template)])
+            template_std = np.std(template[np.nonzero(template)])
+
+            Y, X = np.nonzero(template)
+            x0 = np.min(X)
+            x1 = np.max(X)
+            y0 = np.min(Y)
+            y1 = np.max(Y)
+
+            template = template[y0:y1, x0:x1]
+            template_mask = template > 0
+
+            # template_mask[template > 0] = 1
 
 
+            # toc = time.time()
+        except:
+            template = img
+            template_mask = np.ones_like(img)
+            template_depth = np.median(template[np.nonzero(template)])
+            template_std = np.std(template[np.nonzero(template)])
 
-        return prob_model
+        # print('grabcut : ', toc-tic)
+
+        # ax = plt.subplot(1,2,1)
+        # ax.imshow(img)
+        #
+        # ax2 = plt.subplot(1,2,2)
+        # ax2.imshow(template_mask)
+        # plt.show()
+
+        return template, np.asarray(template_mask, dtype=np.uint8), template_depth, template_std
 
     def initalize_ncc(self, template):
         template = (template - self.depth) * 1.0 / self.depth
@@ -138,7 +195,8 @@ class NCC_depth(torch.nn.Module):
         n = 12
         sigma = l / (4. * n)
         mask = filters.gaussian(mask, sigma=sigma)
-        mask = mask > 0.7 * mask.mean()
+        # mask = mask > 0.7 * mask.mean()
+        mask = mask > mask.mean()
         mask = np.asarray(mask, dtype=np.uint8)
 
         return mask
@@ -166,13 +224,13 @@ class NCC_depth(torch.nn.Module):
 
         response, search_img = self.get_response(search_img)
 
-        target_box, target_mask, peaks, peak_masks, matching_box, aligned_template, boxes_iou = self.localize(frame, search_img, search_region, response)
+        target_box, target_mask, peaks, peak_masks, matching_box, aligned_template, boxes_iou, optimal_angle = self.localize(frame, search_img, search_region, response)
 
         target_box_in_frame = target_box.copy()
         target_box_in_frame[0] = target_box_in_frame[0] + search_region[0]
         target_box_in_frame[1] = target_box_in_frame[1] + search_region[1]
 
-        self.update(target_box_in_frame, target_mask, frame)
+        self.update(target_box_in_frame, target_mask, frame, optimal_angle)
 
         return target_box_in_frame, target_mask, peaks, peak_masks, matching_box, aligned_template, boxes_iou, search_img, response, search_region
 
@@ -188,10 +246,13 @@ class NCC_depth(torch.nn.Module):
         response = ndimage.maximum_filter(response, size=10, mode='constant')
         peaks = feature.peak_local_max(response, min_distance=10)
 
-        scores = [response[pxy[0], pxy[1]] for pxy in peaks]
-        median_scores = np.median(scores)
 
-        peaks = peaks[scores >= median_scores]
+        ''' Remove the peaks with low response scores '''
+
+        # scores = [response[pxy[0], pxy[1]] for pxy in peaks]
+        # median_scores = np.median(scores)
+
+        # peaks = peaks[scores > 0.7 * median_scores]
 
         ''' suitable XY, or D, or Score '''
 
@@ -208,10 +269,9 @@ class NCC_depth(torch.nn.Module):
             pd = np.median(temp_area[np.nonzero(temp_area)])
             d_diff = abs(pd - self.depth) / self.depth
 
-            score = response[py, px]
+            # score = response[py, px]
 
-
-            if xy_dist < xy_threshold and d_diff < 0.5:
+            if xy_dist < 1.5*xy_threshold and d_diff < 0.5:
 
                 center_x.append(px)
                 center_y.append(py)
@@ -229,14 +289,15 @@ class NCC_depth(torch.nn.Module):
         distance = np.asarray(distance)
         sorted_dist = distance.copy()
         sorted_dist.sort()
-        min_distance = sorted_dist[:1]
-        min_idx = [np.where(distance == md)[0][0] for md in min_distance]
-
+        min_distance = sorted_dist[:30]
+        min_idx = list(set([np.where(distance == md)[0][0] for md in min_distance]))
+        min_idx = min_idx[::5]
+        min_idx = min_idx[:3]
         peaks = peaks[min_idx]
         peak_depths = peak_depths[min_idx]
         peak_masks = [self.get_mask(search_img, pd) for pd in peak_depths]
 
-        matching_res, matching_box, aligned_template, boxes_iou = self.mask_matching(search_img, peak_masks)
+        matching_box, aligned_template, boxes_iou, optimal_angles = self.mask_matching(search_img, peak_masks, peaks)
 
         if len(boxes_iou) > 0:
             target_idx = np.where(boxes_iou == np.max(boxes_iou))[0][0]
@@ -245,6 +306,8 @@ class NCC_depth(torch.nn.Module):
 
             target_mask = peak_masks[target_idx]
             target_mask = target_mask[target_box[1]:target_box[1]+target_box[3], target_box[0]:target_box[0]+target_box[2]]
+
+            optimal_angle = optimal_angles[target_idx]
         else:
             print('Not found !!')
             self.flag = 'not_found'
@@ -255,32 +318,42 @@ class NCC_depth(torch.nn.Module):
             target_mask = np.zeros_like(search_img, dtype=np.uint8)
             target_mask = target_mask[target_box[1]:target_box[1]+target_box[3], target_box[0]:target_box[0]+target_box[2]]
 
-        return target_box, target_mask, peaks, peak_masks, matching_box, aligned_template, boxes_iou
+            optimal_angle = self.angle
+
+        return target_box, target_mask, peaks, peak_masks, matching_box, aligned_template, boxes_iou, optimal_angle
 
     def rotate_image(self, image, image_center, angle):
         rot_mat = cv2.getRotationMatrix2D(image_center, angle, 1.0)
         result = cv2.warpAffine(image, rot_mat, image.shape[1::-1], flags=cv2.INTER_LINEAR)
         return result
 
-    def mask_matching(self, search_img, peak_masks):
+    def mask_matching(self, search_img, peak_masks, peaks):
 
         ''' Template matching
             If the method is TM_SQDIFF or TM_SQDIFF_NORMED, take minimum otherwise maximum
         '''
 
-        results, boxes, centers, boxes_iou, aligned_template = [], [], [], [], []
+        results, boxes, centers, boxes_iou, aligned_template, optimal_angles = [], [], [], [], [], []
 
         overlap_template = np.asarray(np.multiply(self.template, self.mask),  dtype=np.float32)
         w, h = overlap_template.shape[::-1]
 
-        for pm in peak_masks:
+
+        for ii, pm in enumerate(peak_masks):
             ''' find the center location based on the Template Matching '''
             overlap_pm = np.multiply(search_img, pm)
             overlap_pm = np.asarray(overlap_pm, dtype=np.float32)
 
-            res_template_match = cv2.matchTemplate(overlap_pm, overlap_template, cv2.TM_SQDIFF) # W-w+, H-h+1
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res_template_match)              # Top-Left Point
-            cnt = [min_loc[0]+int(w/2), min_loc[1]+int(h/2)]                        # center in the search_img
+            ''' Redetect the center ????'''
+            # res_template_match = cv2.matchTemplate(overlap_pm, overlap_template, cv2.TM_SQDIFF) # W-w+, H-h+1
+            # min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res_template_match)              # Top-Left Point
+            # cnt = [min_loc[0]+int(w/2), min_loc[1]+int(h/2)]                        # center in the search_img
+
+            last_cnt = peaks[ii]
+            # print(cnt, last_cnt)
+            # print('1st step and 2nd step  cnt dist : ',np.sqrt((last_cnt[0]-cnt[0])**2 + (last_cnt[1]-cnt[1])**2), 0.7*max(w, h))
+            # if np.sqrt((last_cnt[0]-cnt[0])**2 + (last_cnt[1]-cnt[1])**2) > 0.5*max(w, h):
+            cnt = last_cnt
 
             ''' Find the optimal rotation and scales to get minimal IoU '''
 
@@ -291,6 +364,7 @@ class NCC_depth(torch.nn.Module):
 
                 ''' Translation '''
                 center = [int(cnt[0]+params[2]), int(cnt[1]+params[3])]             # center in the search_img
+                # center = [int(cnt[0]), int(cnt[1])]             # center in the search_img
 
                 ''' Padding '''
                 template_img = np.zeros_like(pm, dtype=np.uint8)
@@ -311,7 +385,10 @@ class NCC_depth(torch.nn.Module):
                 return -1 * iou
 
             params = np.asarray([self.angle, 1.0, 0, 0])
-            res = minimize(iou_loss, params, method='nelder-mead', options={'xatol':1e-2, 'disp':False})
+            # res = minimize(iou_loss, params, method='nelder-mead', options={'xatol':1e-2, 'disp':False})
+            xy_trans_threshold = np.sqrt(w*h)
+            xy_trans_bounds = (-1.0*xy_trans_threshold, 1.0*xy_trans_threshold)
+            res = minimize(iou_loss, params, method='BFGS', options={'xatol':1e-2, 'disp':False}, bounds=[(-45, 45), (0, 2.0), xy_trans_bounds, xy_trans_bounds])
             optimal_angle, optimal_scale, x_trans, y_trans = res.x
             max_iou = -1.0*res.fun
 
@@ -333,36 +410,40 @@ class NCC_depth(torch.nn.Module):
             overlap_tp = rotate_template + pm
             overlap_tp[overlap_tp<2] = 0
 
-            opt_y, opt_x = np.nonzero(overlap_tp)
+            try:
+                opt_y, opt_x = np.nonzero(overlap_tp)
 
-            opt_x0 = np.min(opt_x)
-            opt_y0 = np.min(opt_y)
-            opt_x1 = np.max(opt_x)
-            opt_y1 = np.max(opt_y)
+                opt_x0 = np.min(opt_x)
+                opt_y0 = np.min(opt_y)
+                opt_x1 = np.max(opt_x)
+                opt_y1 = np.max(opt_y)
 
-            opt_boxes = [opt_x0, opt_y0, opt_x1-opt_x0, opt_y1-opt_y0]
+                opt_boxes = [opt_x0, opt_y0, opt_x1-opt_x0, opt_y1-opt_y0]
+            except:
+                opt_boxes = [0, 0, overlap_tp.shape[1], overlap_tp.shape[0]]
 
             rotate_template = rotate_template + pm
             aligned_template.append(rotate_template)
 
-            results.append(res_template_match)
+            # results.append(res_template_match)
             boxes.append(opt_boxes)
             centers.append(cnt)
             boxes_iou.append(max_iou)
+            optimal_angles.append(optimal_angle)
 
 
         aligned_template = np.asarray(aligned_template)
-        results = np.asarray(results)
         boxes = np.asarray(boxes)
         centers = np.asarray(centers)
         boxes_iou = np.asarray(boxes_iou)
+        optimal_angles = np.asarray(optimal_angles)
 
 
-        return results, boxes, aligned_template, boxes_iou
+        return boxes, aligned_template, boxes_iou, optimal_angles
 
 
 
-    def update(self, prediction_box, prediction_mask, frame):
+    def update(self, prediction_box, prediction_mask, frame, optimal_angle):
         pred_area = prediction_box[2]*prediction_box[3]
         pred_center = [prediction_box[0]+prediction_box[2]//2, prediction_box[1]+prediction_box[3]//2]
 
@@ -375,24 +456,26 @@ class NCC_depth(torch.nn.Module):
 
         distance_threshold = np.sqrt(self.pos[2]*self.pos[3])
 
-        if area_diff < 0.1 and cnt_diff < distance_threshold:
+        print('area diff :', area_diff, ' cnt_diff : ', cnt_diff)
+        if area_diff < 0.3 and cnt_diff < distance_threshold:
 
             print('Update ....')
             self.pos = prediction_box
             # self.mask = prediction_mask
             #
+            self.angle = optimal_angle
             # self.template = frame[prediction_box[1]:prediction_box[1]+prediction_box[3], prediction_box[0]:prediction_box[0]+prediction_box[2]]
             self.depth = np.median(self.template[np.nonzero(self.template)])
             # self.std = np.std(self.template[np.nonzero(self.template)])
 
 
-def visualize(template, template_mask, frame, search_region, target_box, target_mask, response, peaks, peak_masks, matching_box, aligned_template, M=2, N=4):
+def visualize(template, template_mask, frame, search_region, target_box, target_mask, response, peaks, peak_masks, matching_box, aligned_template):
     fig = plt.figure(1)
 
     plt.clf()
 
     M = 4
-    N = 4
+    N = 3
     #
     ax1 = fig.add_subplot(M,N,1)
 
@@ -405,25 +488,39 @@ def visualize(template, template_mask, frame, search_region, target_box, target_
     ax2.imshow(template_mask)
     ax2.set_title('tracker.mask')
 
-    ax3 = fig.add_subplot(M,N,3)
+    ax = fig.add_subplot(M, N, 3)
+    overlap_template = np.multiply(template, template_mask)
+    ax.imshow(overlap_template)
+    ax.set_title('Template overlap')
+
+
+
+    ax3 = fig.add_subplot(M,N,4)
     ax3.imshow(frame)
     rect = patches.Rectangle((target_box[0], target_box[1]), target_box[2], target_box[3], edgecolor='b', facecolor='none')
     ax3.add_patch(rect)
     ax3.set_title('frame')
 
-    ax4 = fig.add_subplot(M, N, 4)
+    ax4 = fig.add_subplot(M, N, 5)
     ax4.imshow(response)
+    ax4.set_title('NCC Response')
 
     search_x0, search_y0, search_w, search_h = search_region
     rect = patches.Rectangle((search_x0, search_y0), search_w, search_h, edgecolor='r', facecolor='none')
     ax3.add_patch(rect)
 
+
     for p_xy in peaks:
         ax3.scatter(p_xy[0]+search_x0, p_xy[1]+search_y0, linewidth=1, c='r')
         ax4.scatter(p_xy[0], p_xy[1], linewidth=1, c='r')
 
+
+    ax = fig.add_subplot(M, N, 6)
+    ax.imshow(target_mask)
+    ax.set_title('Pred Mask')
+
     for ii, pm in enumerate(peak_masks):
-        ax = fig.add_subplot(M, N, 5+ii)
+        ax = fig.add_subplot(M, N, 7+ii)
 
         p_xy = peaks[ii]
         ax.imshow(pm)
@@ -433,10 +530,11 @@ def visualize(template, template_mask, frame, search_region, target_box, target_
         rect = patches.Rectangle((box[0], box[1]), box[2], box[3], edgecolor='b', facecolor='none')
         ax.add_patch(rect)
         ax.scatter(center[0], center[1], linewidth=1, c='b')
-
+        ax.set_yticks([])
+        ax.set_xticks([])
 
     for ii, at in enumerate(aligned_template):
-        ax = fig.add_subplot(M, N, 6+ii)
+        ax = fig.add_subplot(M, N, 10+ii)
         ax.imshow(at)
 
         box = matching_box[ii, ...]
@@ -447,9 +545,9 @@ def visualize(template, template_mask, frame, search_region, target_box, target_
 
         iou = boxes_iou[ii]
         ax.set_title('iou :'+str(iou))
+        ax.set_yticks([])
+        ax.set_xticks([])
 
-    ax = fig.add_subplot(M, N, 8)
-    ax.imshow(target_mask)
 
     plt.show(block=False)
     plt.pause(0.1)
@@ -457,14 +555,18 @@ def visualize(template, template_mask, frame, search_region, target_box, target_
 
 if __name__ == '__main__':
 
-    root_path = '/home/yan/Data2/vot-workspace-CDTB/sequences/'
+    root_path = '/home/yan/Data2/DOT-results/CDTB-ST/sequences/'
 
-    out_path = '/home/yan/Data2/DOT-results/CDTB/results/NCC_D/'
-    if not os.path.isdir(out_path):
-        os.mkdir(out_path)
-    out_path = out_path + 'rgbd-unsupervised/'
-    if not os.path.isdir(out_path):
-        os.mkdir(out_path)
+
+    save_results = False
+
+    if save_results:
+        out_path = '/home/yan/Data2/DOT-results/CDTB-ST/results/NCC_D/'
+        if not os.path.isdir(out_path):
+            os.mkdir(out_path)
+        out_path = out_path + 'rgbd-unsupervised/'
+        if not os.path.isdir(out_path):
+            os.mkdir(out_path)
 
     # seq = 'humans_shirts_room_occ_1_A' # !!!!!!
     # seq = 'backpack_blue'    #!!!!!
@@ -480,7 +582,7 @@ if __name__ == '__main__':
     sequences = os.listdir(root_path)
     sequences.remove('list.txt')
 
-    sequences = ['box_darkroom_noocc_6']
+    # sequences = ['backpack_blue']
 
     for seq in sequences:
         print(seq)
@@ -505,7 +607,7 @@ if __name__ == '__main__':
 
         template = init_frame[init_box[1]:init_box[1]+init_box[3], init_box[0]:init_box[0]+init_box[2]]
 
-        tracker = NCC_depth(template, init_box)
+        tracker = NCC_depth(init_frame, template, init_box)
         tracker = tracker.cuda()
 
         toc = time.time()
@@ -520,7 +622,8 @@ if __name__ == '__main__':
             frame = cv2.imread(os.path.join(data_path, '%08d.png'%(frame_id+1)), -1)
             target_box, target_mask, peaks, peak_masks, matching_box, aligned_template, boxes_iou, search_img, response, search_region = tracker.track(frame)
 
-            visualize(template, tracker.mask, frame, search_region, target_box, target_mask, response, peaks, peak_masks, matching_box, aligned_template, M=2, N=4)
+            if tracker.visualize:
+                visualize(tracker.template, tracker.mask, frame, search_region, target_box, target_mask, response, peaks, peak_masks, matching_box, aligned_template)
 
             toc_track = time.time()
             print('Track a frame time : ', toc_track - tic_track)
@@ -528,18 +631,19 @@ if __name__ == '__main__':
             pred_boxes.append(target_box)
             pred_times.append(toc-tic)
 
-        # out_seq = out_path + seq + '/'
-        # if not os.path.isdir(out_seq):
-        #     os.mkdir(out_seq)
-        #
-        # with open(os.path.join(out_seq, '%s_001.txt'%seq), 'w') as fp:
-        #     for pb in pred_boxes:
-        #         fp.write('%d,%d,%d,%d\n'%(int(pb[0]), int(pb[1]), int(pb[2]), int(pb[2])))
-        #
-        # with open(os.path.join(out_seq, '%s_001_time.value'%seq), 'w') as fp:
-        #     for pt in pred_times:
-        #         fp.write('%f\n'%(pt))
-        #
-        # with open(os.path.join(out_seq, '%s_001_confidence.value'%seq), 'w') as fp:
-        #     for pt in pred_times:
-        #         fp.write('1\n')
+        if save_results:
+            out_seq = out_path + seq + '/'
+            if not os.path.isdir(out_seq):
+                os.mkdir(out_seq)
+
+            with open(os.path.join(out_seq, '%s_001.txt'%seq), 'w') as fp:
+                for pb in pred_boxes:
+                    fp.write('%d,%d,%d,%d\n'%(int(pb[0]), int(pb[1]), int(pb[2]), int(pb[2])))
+
+            with open(os.path.join(out_seq, '%s_001_time.value'%seq), 'w') as fp:
+                for pt in pred_times:
+                    fp.write('%f\n'%(pt))
+
+            with open(os.path.join(out_seq, '%s_001_confidence.value'%seq), 'w') as fp:
+                for pt in pred_times:
+                    fp.write('1\n')
